@@ -1,7 +1,6 @@
-package email_validator
+package emailvalidator
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -9,10 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,7 +18,6 @@ import (
 type Config struct {
 	UpdateTime time.Duration `env:"EMAIL_SERVICE_FILE_UPDATE_DURATION,required"`
 	Url        string        `env:"EMAIL_SERVICE_FILE_URL,required"`
-	FileName   string        `env:"EMAIL_SERVICE_FILE_NAME"                     envDefault:"email_bad_domain_list.txt"`
 	UpdateTask bool          `env:"EMAIL_SERVICE_UPDATE_TASK"                   envDefault:"true"`
 }
 type EmailService struct {
@@ -69,7 +64,7 @@ func New(ctx context.Context, log *slog.Logger, cfg *Config) (es *EmailService, 
 
 	es.client = &http.Client{Timeout: 15 * time.Second}
 
-	if err = es.updateFile(ctx); err != nil {
+	if err = es.refresh(ctx); err != nil {
 		return nil, fmt.Errorf("%s -> %w", op, err)
 	}
 
@@ -87,7 +82,9 @@ func (s *EmailService) IsDomainValid(domain string) bool {
 	}
 
 	n := len(st.offsets)
-	targetBytes := []byte(domain)
+
+	// danger
+	targetBytes := unsafe.Slice(unsafe.StringData(domain), len(domain))
 
 	idx := sort.Search(n, func(i int) bool {
 		start := st.offsets[i]
@@ -124,7 +121,7 @@ func (s *EmailService) updater(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			if err := s.updateFile(ctx); err != nil {
+			if err := s.refresh(ctx); err != nil {
 				s.log.LogAttrs(ctx, slog.LevelError, "Get file disposable email domains error",
 					slog.String("op", op),
 					slog.String("error", err.Error()),
@@ -138,19 +135,14 @@ func (s *EmailService) updater(ctx context.Context) {
 
 var ErrNothingToUpdate = errors.New("nothing to update")
 
-func (s *EmailService) updateFile(ctx context.Context) (err error) {
-	const op = "emailservice.updateFile"
+func (s *EmailService) refresh(ctx context.Context) (err error) {
+	const op = "emailservice.refresh"
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	file, err := os.Create(s.cfg.FileName)
+	buf, err := s.fetchLatestData(ctx)
 	if err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
-	}
-	defer file.Close()
-
-	if err = s.parseRequest(ctx, file); err != nil {
 		if errors.Is(err, ErrNothingToUpdate) {
 			return nil
 		}
@@ -158,110 +150,95 @@ func (s *EmailService) updateFile(ctx context.Context) (err error) {
 		return fmt.Errorf("%s -> %w", op, err)
 	}
 
-	if err = s.parseFile(ctx, file); err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
-	}
+	newStorage := s.buildStorage(ctx, buf)
 
-	s.log.LogAttrs(ctx, slog.LevelInfo, "Successful update bad email domain list")
+	s.storage.Store(newStorage)
+
+	s.log.LogAttrs(ctx, slog.LevelInfo, "Successful update bad email domain list", slog.Int("byte_count", s.size()))
 
 	return nil
 }
 
-func (s *EmailService) parseRequest(_ context.Context, file *os.File) error {
-	const op = "emailservice.parseRequest"
+func (s *EmailService) fetchLatestData(ctx context.Context) ([]byte, error) {
+	const op = "emailservice.fetchLatestData"
 
 	if s.eTag != "" {
 		s.request.Header.Set("If-None-Match", s.eTag)
 	}
 
-	resp, err := s.client.Do(s.request)
+	resp, err := s.client.Do(s.request.WithContext(ctx))
 	if err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
+		return nil, fmt.Errorf("%s -> %w", op, err)
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
-		return ErrNothingToUpdate
+		return nil, ErrNothingToUpdate
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
 	etag := resp.Header.Get("ETag")
-	if etag == "" {
-		return errors.New("invalid ETag")
+	if etag != "" {
+		s.eTag = etag
 	}
-
-	s.eTag = etag
 
 	if resp.ContentLength == 0 {
-		return errors.New("empty response body")
+		return nil, errors.New("empty response body")
 	}
 
-	if _, err := bufio.NewReader(resp.Body).WriteTo(file); err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
+	buf, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s -> %w", op, err)
 	}
 
-	if err = s.resetCursor(file); err != nil {
-		return err
-	}
-
-	return nil
+	return buf, nil
 }
 
-func (s *EmailService) parseFile(ctx context.Context, file *os.File) error {
-	const op = "emailservice.parseFile"
-
-	lineCount, err := s.fileLineCount(file)
-	if err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
+func (s *EmailService) buildStorage(_ context.Context, buf []byte) *storage {
+	st := storage{
+		data: make([]byte, 0, len(buf)),
+		// write first offset
+		offsets: make([]uint32, 1, len(buf)/10),
 	}
 
-	var res = make([]string, 0, lineCount)
+	buf = bytes.TrimSpace(buf)
 
-	reader := bufio.NewReader(file)
+	var offset uint32
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
+	for i := 0; i < len(buf); i++ {
+		val := buf[i]
+		if val == '\n' {
+			// if already write offset
+			if st.offsets[len(st.offsets)-1] == offset {
+				continue
 			}
 
-			return fmt.Errorf("%s -> %w", op, err)
+			st.offsets = append(st.offsets, offset)
+			continue
 		}
 
-		res = append(res, strings.TrimSpace(line))
+		if val == ' ' || val == '\r' || val == '\t' {
+			continue
+		}
+
+		// write byte
+		st.data = append(st.data, val)
+		offset++
 	}
 
-	s.storeData(ctx, res)
+	var data = make([]byte, len(st.data))
+	copy(data, st.data)
+	var dataOffset = make([]uint32, len(st.offsets))
+	copy(dataOffset, st.offsets)
 
-	s.log.LogAttrs(ctx, slog.LevelInfo, "Bytes count", slog.Int("bytes", s.size()))
+	st.data = data
+	st.offsets = dataOffset
 
-	return nil
-}
-
-func (s *EmailService) storeData(ctx context.Context, payload []string) {
-	slices.Sort(payload)
-
-	var dataLen int
-
-	for _, val := range payload {
-		dataLen += len(val)
-	}
-
-	var data = make([]byte, 0, dataLen)
-	var offset = make([]uint32, len(payload))
-
-	for idx, val := range payload {
-		offset[idx] = uint32(len(data))
-		data = append(data, []byte(val)...)
-	}
-
-	s.storage.Store(&storage{
-		data:    data,
-		offsets: offset,
-	})
-
-	s.log.LogAttrs(ctx, slog.LevelInfo, "Bytes count", slog.Int("bytes", s.size()))
+	return &st
 }
 
 // for data = []byte and offsets = []uint32
@@ -277,30 +254,4 @@ func (s *EmailService) size() int {
 	var offsetSize = len(storage.offsets) * 4
 
 	return sliceDataSize + sliceOffsetSize + dataSize + offsetSize
-}
-
-func (s *EmailService) resetCursor(file *os.File) error {
-	const op = "emailservice.resetCursor"
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("%s -> %w", op, err)
-	}
-
-	return nil
-}
-
-func (s *EmailService) fileLineCount(file *os.File) (count int, err error) {
-	const op = "emailservice.fileLineCount"
-
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		count++
-	}
-
-	if err = s.resetCursor(file); err != nil {
-		return 0, fmt.Errorf("%s -> %w", op, err)
-	}
-
-	return count, nil
 }
