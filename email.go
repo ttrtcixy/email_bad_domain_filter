@@ -1,4 +1,4 @@
-package emailvalidator
+package emailfilter
 
 import (
 	"bytes"
@@ -16,11 +16,11 @@ import (
 )
 
 type Config struct {
-	UpdateTime time.Duration `env:"EMAIL_SERVICE_FILE_UPDATE_DURATION,required"`
-	Url        string        `env:"EMAIL_SERVICE_FILE_URL,required"`
-	UpdateTask bool          `env:"EMAIL_SERVICE_UPDATE_TASK"                   envDefault:"true"`
+	UpdateTime time.Duration `env:"EMAIL_FILTER_FILE_UPDATE_DURATION,required"`
+	Url        string        `env:"EMAIL_FILTER_FILE_URL,required"`
+	UpdateTask bool          `env:"EMAIL_FILTER_UPDATE_TASK"                   envDefault:"true"`
 }
-type EmailService struct {
+type Filter struct {
 	storage atomic.Pointer[storage]
 
 	log *slog.Logger
@@ -44,10 +44,10 @@ var defaultStore = &storage{
 	offsets: make([]uint32, 0),
 }
 
-func New(ctx context.Context, log *slog.Logger, cfg *Config) (es *EmailService, err error) {
-	const op = "emailservice.New"
+func New(ctx context.Context, log *slog.Logger, cfg *Config) (es *Filter, err error) {
+	const op = "emailfilter.New"
 
-	es = &EmailService{
+	es = &Filter{
 		log: log,
 		cfg: cfg,
 		mu:  sync.Mutex{},
@@ -75,8 +75,8 @@ func New(ctx context.Context, log *slog.Logger, cfg *Config) (es *EmailService, 
 	return es, nil
 }
 
-func (s *EmailService) IsDomainValid(domain string) bool {
-	st := s.storage.Load()
+func (f *Filter) IsDomainValid(domain string) bool {
+	st := f.storage.Load()
 	if st == nil || len(st.offsets) == 0 {
 		return true
 	}
@@ -113,16 +113,16 @@ func (s *EmailService) IsDomainValid(domain string) bool {
 	return true
 }
 
-func (s *EmailService) updater(ctx context.Context) {
-	const op = "emailservice.updater"
+func (f *Filter) updater(ctx context.Context) {
+	const op = "emailfilter.updater"
 
-	ticker := time.NewTicker(s.cfg.UpdateTime)
+	ticker := time.NewTicker(f.cfg.UpdateTime)
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := s.refresh(ctx); err != nil {
-				s.log.LogAttrs(ctx, slog.LevelError, "Get file disposable email domains error",
+			if err := f.refresh(ctx); err != nil {
+				f.log.LogAttrs(ctx, slog.LevelError, "Get file disposable email domains error",
 					slog.String("op", op),
 					slog.String("error", err.Error()),
 				)
@@ -135,13 +135,13 @@ func (s *EmailService) updater(ctx context.Context) {
 
 var ErrNothingToUpdate = errors.New("nothing to update")
 
-func (s *EmailService) refresh(ctx context.Context) (err error) {
-	const op = "emailservice.refresh"
+func (f *Filter) refresh(ctx context.Context) (err error) {
+	const op = "emailfilter.refresh"
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	buf, err := s.fetchLatestData(ctx)
+	buf, err := f.fetchLatestData(ctx)
 	if err != nil {
 		if errors.Is(err, ErrNothingToUpdate) {
 			return nil
@@ -150,28 +150,30 @@ func (s *EmailService) refresh(ctx context.Context) (err error) {
 		return fmt.Errorf("%s -> %w", op, err)
 	}
 
-	newStorage := s.buildStorage(ctx, buf)
+	newStorage := f.buildStorage(ctx, buf)
 
-	s.storage.Store(newStorage)
+	f.storage.Store(newStorage)
 
-	s.log.LogAttrs(ctx, slog.LevelInfo, "Successful update bad email domain list", slog.Int("byte_count", s.size()))
+	f.log.LogAttrs(ctx, slog.LevelDebug, "Successful update bad email domain list", slog.Int("byte_count", f.size()))
 
 	return nil
 }
 
-func (s *EmailService) fetchLatestData(ctx context.Context) ([]byte, error) {
-	const op = "emailservice.fetchLatestData"
+func (f *Filter) fetchLatestData(ctx context.Context) ([]byte, error) {
+	const op = "emailfilter.fetchLatestData"
 
-	if s.eTag != "" {
-		s.request.Header.Set("If-None-Match", s.eTag)
+	if f.eTag != "" {
+		f.request.Header.Set("If-None-Match", f.eTag)
 	}
 
-	resp, err := s.client.Do(s.request.WithContext(ctx))
+	resp, err := f.client.Do(f.request.WithContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("%s -> %w", op, err)
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode == http.StatusNotModified {
 		return nil, ErrNothingToUpdate
@@ -183,7 +185,7 @@ func (s *EmailService) fetchLatestData(ctx context.Context) ([]byte, error) {
 
 	etag := resp.Header.Get("ETag")
 	if etag != "" {
-		s.eTag = etag
+		f.eTag = etag
 	}
 
 	if resp.ContentLength == 0 {
@@ -198,7 +200,7 @@ func (s *EmailService) fetchLatestData(ctx context.Context) ([]byte, error) {
 	return buf, nil
 }
 
-func (s *EmailService) buildStorage(_ context.Context, buf []byte) *storage {
+func (f *Filter) buildStorage(_ context.Context, buf []byte) *storage {
 	st := storage{
 		data: make([]byte, 0, len(buf)),
 		// write first offset
@@ -242,8 +244,8 @@ func (s *EmailService) buildStorage(_ context.Context, buf []byte) *storage {
 }
 
 // for data = []byte and offsets = []uint32
-func (s *EmailService) size() int {
-	storage := *s.storage.Load()
+func (f *Filter) size() int {
+	storage := *f.storage.Load()
 
 	var sliceDataSize = int(unsafe.Sizeof(storage.data))
 
